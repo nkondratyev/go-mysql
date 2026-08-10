@@ -111,8 +111,17 @@ func (c *Conn) readInitialHandshake() error {
 		}
 		pos++
 
-		// skip reserved (all [00] ?)
-		pos += 10
+		if len(data) < pos+10 {
+			return mysql.ErrMalformPacket
+		}
+
+		// MariaDB uses the last 4 bytes of the 10-byte reserved area for
+		// extended server capabilities. The first 6 bytes remain reserved.
+		pos += 6
+		if c.capability&mysql.CLIENT_MYSQL == 0 {
+			c.mariadbServerCapabilities = mysql.MariaDBCapability(binary.LittleEndian.Uint32(data[pos : pos+4]))
+		}
+		pos += 4
 
 		if c.capability&mysql.CLIENT_SECURE_CONNECTION != 0 {
 			// Rest of the plugin provided data (scramble)
@@ -216,6 +225,10 @@ func (c *Conn) writeAuthHandshake() error {
 	capability := mysql.CLIENT_PROTOCOL_41 | mysql.CLIENT_SECURE_CONNECTION |
 		mysql.CLIENT_LONG_PASSWORD | mysql.CLIENT_TRANSACTIONS | mysql.CLIENT_PLUGIN_AUTH |
 		mysql.CLIENT_LONG_FLAG | mysql.CLIENT_QUERY_ATTRIBUTES | mysql.CLIENT_DEPRECATE_EOF
+	isMariaDB := c.capability&mysql.CLIENT_MYSQL == 0
+	if isMariaDB {
+		capability &^= mysql.CLIENT_MYSQL
+	}
 	// Adjust client capability flags on specific client requests
 	// Only flags that would make any sense setting and aren't handled elsewhere
 	// in the library are supported here
@@ -274,19 +287,16 @@ func (c *Conn) writeAuthHandshake() error {
 	}
 
 	data := make([]byte, length+4)
+	// First 4 bytes reserved for header: 3 bytes packet length + 1 byte sequence number
+	pos := 4
 
 	// capability [32 bit]
 	c.capability &= capability
-	data[4] = byte(capability)
-	data[5] = byte(capability >> 8)
-	data[6] = byte(capability >> 16)
-	data[7] = byte(capability >> 24)
+	binary.LittleEndian.PutUint32(data[pos:], capability)
+	pos += 4
 
 	// MaxPacketSize [32 bit] (none)
-	data[8] = 0x00
-	data[9] = 0x00
-	data[10] = 0x00
-	data[11] = 0x00
+	pos += 4
 
 	// Charset [1 byte]
 	// use default collation id 255 here, is `utf8mb4_0900_ai_ci`
@@ -301,7 +311,19 @@ func (c *Conn) writeAuthHandshake() error {
 
 	// the MySQL protocol calls for the collation id to be sent as 1 byte, where only the
 	// lower 8 bits are used in this field.
-	data[12] = byte(collation.ID & 0xff)
+	data[pos] = byte(collation.ID & 0xff)
+	pos++
+
+	// Next 23 bytes are reserved and already zero-initialized by make.
+	// The first 19 bytes are reserved by both protocols. MariaDB uses the
+	// remaining 4 bytes for the negotiated capability extension.
+	pos += 19
+
+	if isMariaDB {
+		negotiated := c.mariadbServerCapabilities & c.mariadbClientCapabilities
+		binary.LittleEndian.PutUint32(data[pos:pos+4], uint32(negotiated))
+	}
+	pos += 4
 
 	// SSL Connection Request Packet
 	// http://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::SSLRequest
@@ -320,12 +342,6 @@ func (c *Conn) writeAuthHandshake() error {
 		currentSequence := c.Sequence
 		c.Conn = packet.NewConnWithTimeout(tlsConn, c.ReadTimeout, c.WriteTimeout, c.BufferSize)
 		c.Sequence = currentSequence
-	}
-
-	// Filler [23 bytes] (all 0x00)
-	pos := 13
-	for ; pos < 13+23; pos++ {
-		data[pos] = 0
 	}
 
 	// User [null terminated string]

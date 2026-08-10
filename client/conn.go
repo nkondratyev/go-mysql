@@ -28,6 +28,19 @@ const defaultBufferSize = 65536 // 64kb
 
 type Option func(*Conn) error
 
+// WithMariaDBCapabilities enables MariaDB capability extension flags during connection handshake.
+func WithMariaDBCapabilities(caps ...mysql.MariaDBCapability) Option {
+	var enabled mysql.MariaDBCapability
+	for _, cap := range caps {
+		enabled |= cap
+	}
+
+	return func(c *Conn) error {
+		c.mariadbClientCapabilities |= enabled
+		return nil
+	}
+}
+
 type Conn struct {
 	*packet.Conn
 
@@ -52,6 +65,12 @@ type Conn struct {
 	// Capability flags explicitly disabled by the client via UnsetCapability()
 	// These flags are removed from the final advertised capability set during handshake.
 	clientExplicitOffCaps uint32
+
+	// MariaDB capabilities extension
+	// Capabilities advertised by the MariaDB server.
+	mariadbServerCapabilities mysql.MariaDBCapability
+	// Capabilities supported and enabled by this client.
+	mariadbClientCapabilities mysql.MariaDBCapability
 
 	attributes map[string]string
 
@@ -261,6 +280,18 @@ func (c *Conn) UnsetCapability(capability uint32) {
 // HasCapability returns true if the connection has the specific capability
 func (c *Conn) HasCapability(capability uint32) bool {
 	return c.ccaps&capability != 0
+}
+
+// HasMariaDBCapability returns true if the capability is enabled by the client.
+func (c *Conn) HasMariaDBCapability(capability mysql.MariaDBCapability) bool {
+	return c.mariadbClientCapabilities&capability != 0
+}
+
+// HasNegotiatedMariaDBCapability returns true if both the client and server support the capability.
+func (c *Conn) HasNegotiatedMariaDBCapability(capability mysql.MariaDBCapability) bool {
+	return c.mariadbServerCapabilities&
+		c.mariadbClientCapabilities&
+		capability != 0
 }
 
 // UseSSL: use default SSL
